@@ -108,6 +108,7 @@ export default async function handler(req, res) {
       details: {
         gameTitle,
         platform,
+        status: "pending",
       },
     });
 
@@ -125,6 +126,11 @@ export default async function handler(req, res) {
             gameTitle,
             platform,
             details,
+            status: "pending",
+            reply: "",
+            statusUpdatedAt: "",
+            notificationSentAt: "",
+            emailSentAt: "",
           },
         })
       );

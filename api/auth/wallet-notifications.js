@@ -3,13 +3,16 @@ import { requireUser } from "../../lib/auth.js";
 import { setCors } from "../../lib/http.js";
 import {
   createWalletNotification,
+  deleteGameRequestNotification,
   deleteAllWalletNotifications,
   deleteWalletNotification,
   getWalletNotifications,
   markAllWalletNotificationsRead,
   markWalletNotificationRead,
+  updateGameRequestNotification,
 } from "../../lib/wallet-notifications.js";
 import { getWalletTransactions } from "../../lib/wallet-ledger.js";
+import { sendGameRequestReplyEmail } from "../../lib/wallet-mailer.js";
 
 function enrichLegacyNotificationDetails(notifications, transactions) {
   return notifications.map((notification) => {
@@ -198,6 +201,273 @@ export default async function handler(req, res) {
     }
 
     const body = getRequestBody(req);
+    if (body.action === "delete-game-request") {
+      if (!getNotificationAdmins().has(username.toLowerCase())) {
+        return res.status(403).json({ error: "Admin access is required." });
+      }
+
+      const notificationId =
+        typeof body.notificationId === "string"
+          ? body.notificationId.trim()
+          : "";
+      if (!notificationId || notificationId.length > 100) {
+        return res.status(400).json({
+          error: "A valid game request ID is required.",
+        });
+      }
+
+      const deleted = await deleteGameRequestNotification({
+        username,
+        notificationId,
+      });
+      if (!deleted) {
+        return res.status(404).json({ error: "Game request was not found." });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Game request deleted.",
+      });
+    }
+
+    if (body.action === "update-game-request") {
+      if (!getNotificationAdmins().has(username.toLowerCase())) {
+        return res.status(403).json({ error: "Admin access is required." });
+      }
+
+      const notificationId =
+        typeof body.notificationId === "string"
+          ? body.notificationId.trim()
+          : "";
+      const status = body.status;
+      const replyInput =
+        typeof body.reply === "string"
+          ? body.reply.replace(/\r\n?/g, "\n").trim()
+          : "";
+      if (
+        !notificationId ||
+        notificationId.length > 100 ||
+        !["pending", "accepted", "rejected"].includes(status) ||
+        (body.reply !== undefined &&
+          (typeof body.reply !== "string" || body.reply.length > 2000))
+      ) {
+        return res.status(400).json({
+          error: "Enter a valid game request status and reply.",
+        });
+      }
+
+      let reply = "";
+      let alreadyNotified = false;
+      let emailAlreadySent = false;
+      const statusUpdatedAt = new Date().toISOString();
+      const updatedRequest = await updateGameRequestNotification({
+        username,
+        notificationId,
+        updateDetails: (current) => {
+          const gameTitle =
+            typeof current.gameTitle === "string" ? current.gameTitle : "";
+          const requesterUsername =
+            typeof current.username === "string" ? current.username : "";
+          const email =
+            typeof current.email === "string"
+              ? current.email.trim().toLowerCase()
+              : "";
+          const platform =
+            typeof current.platform === "string" ? current.platform : "";
+          if (
+            !gameTitle ||
+            !requesterUsername ||
+            !platform ||
+            !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+          ) {
+            throw new Error("Game request contact details are invalid.");
+          }
+
+          reply =
+            status === "pending"
+              ? replyInput
+              : replyInput || `Your request for ${gameTitle} was ${status}.`;
+          const previousStatus = ["pending", "accepted", "rejected"].includes(
+            current.status
+          )
+            ? current.status
+            : "pending";
+          const previousNotificationSentAt =
+            typeof current.notificationSentAt === "string"
+              ? current.notificationSentAt
+              : "";
+          alreadyNotified =
+            status !== "pending" &&
+            previousStatus === status &&
+            current.reply === reply &&
+            Boolean(previousNotificationSentAt) &&
+            Boolean(current.replyNotificationId);
+          const previousEmailSentAt =
+            typeof current.emailSentAt === "string"
+              ? current.emailSentAt
+              : !Object.hasOwn(current, "emailSentAt") && alreadyNotified
+                ? previousNotificationSentAt
+                : "";
+          emailAlreadySent = alreadyNotified && Boolean(previousEmailSentAt);
+
+          return {
+            ...current,
+            status,
+            reply,
+            statusUpdatedAt,
+            notificationSentAt:
+              status === "pending"
+                ? ""
+                : alreadyNotified
+                  ? previousNotificationSentAt
+                  : "",
+            emailSentAt:
+              status === "pending"
+                ? ""
+                : alreadyNotified
+                  ? previousEmailSentAt
+                  : "",
+            replyNotificationId:
+              status === "pending"
+                ? ""
+                : alreadyNotified
+                  ? String(current.replyNotificationId || "")
+                  : "",
+          };
+        },
+      });
+      if (!updatedRequest) {
+        return res.status(404).json({ error: "Game request was not found." });
+      }
+
+      if (status === "pending") {
+        return res.status(200).json({
+          success: true,
+          message: "Game request status saved.",
+          notificationSentAt: "",
+          emailSentAt: "",
+        });
+      }
+      const request = updatedRequest.details;
+      let notificationSentAt = String(request.notificationSentAt || "");
+      let emailSentAt = String(request.emailSentAt || "");
+
+      if (alreadyNotified && emailAlreadySent) {
+        return res.status(200).json({
+          success: true,
+          message: "Status saved; the player was already notified in GameOnix and by email.",
+          notificationSentAt,
+          emailSentAt,
+        });
+      }
+
+      let playerNotification;
+      if (!alreadyNotified) {
+        try {
+          playerNotification = await createWalletNotification({
+            username: request.username,
+            title: `Your game request was ${status}`,
+            message: reply,
+            type: "game_request_reply",
+            details: {
+              gameTitle: request.gameTitle,
+              platform: request.platform,
+              status,
+              reply,
+              requestId: request.requestId || notificationId,
+            },
+          });
+
+          notificationSentAt = new Date().toISOString();
+          const deliveryRecorded = await updateGameRequestNotification({
+            username,
+            notificationId,
+            updateDetails: (current) => ({
+              ...current,
+              notificationSentAt,
+              emailSentAt: "",
+              replyNotificationId: playerNotification.id,
+            }),
+          });
+          if (!deliveryRecorded) {
+            throw new Error(
+              "The game request disappeared before the in-app notification was recorded."
+            );
+          }
+        } catch (error) {
+          console.error("Game request in-app reply delivery failed:", error);
+          if (playerNotification) {
+            try {
+              await deleteWalletNotification(
+                request.username,
+                playerNotification.id
+              );
+            } catch (cleanupError) {
+              console.error(
+                "Failed to clean up unrecorded game request notification:",
+                cleanupError
+              );
+            }
+          }
+
+          return res.status(502).json({
+            error:
+              "The status was saved, but we could not save the in-app notification. Try saving again.",
+          });
+        }
+      }
+
+      if (!emailAlreadySent) {
+        try {
+          await sendGameRequestReplyEmail({
+            gameTitle: request.gameTitle,
+            platform: request.platform,
+            status,
+            reply,
+            username: request.username,
+            to: request.email,
+          });
+        } catch (error) {
+          console.error("Game request reply email failed:", error);
+          return res.status(200).json({
+            success: true,
+            message:
+              "Status and in-app notification were saved, but email delivery failed. Check the email configuration and save again to retry without sending a duplicate in-app notification.",
+            notificationSentAt,
+            emailSentAt: "",
+          });
+        }
+
+        emailSentAt = new Date().toISOString();
+        const emailDeliveryRecorded = await updateGameRequestNotification({
+          username,
+          notificationId,
+          updateDetails: (current) => ({
+            ...current,
+            emailSentAt,
+          }),
+        });
+        if (!emailDeliveryRecorded) {
+          console.error(
+            "Game request email was sent, but its delivery record could not be saved."
+          );
+          return res.status(502).json({
+            error:
+              "The player was notified in GameOnix and by email, but the email delivery record could not be saved. Check before retrying.",
+            notificationSentAt,
+            emailSentAt: "",
+          });
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        message:
+          "Status saved and the player was notified by email and in GameOnix.",
+        notificationSentAt,
+        emailSentAt,
+      });
+    }
     if (body.action === "send-password-reset-link") {
       if (!getNotificationAdmins().has(username.toLowerCase())) {
         return res.status(403).json({ error: "Admin access is required." });
