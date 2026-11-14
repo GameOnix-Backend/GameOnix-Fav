@@ -22,3 +22,5 @@ build/
 *.pem
 *.key
 *service-account*.json
+.vercel
+.env*

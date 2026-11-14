@@ -1,12 +1,17 @@
 import { requireUser } from "../../lib/auth.js";
 import { setCors } from "../../lib/http.js";
 import { getWalletBalanceByUsername } from "../../lib/sheets.js";
-import { createWalletPurchaseRequest } from "../../lib/wallet-ledger.js";
+import {
+  createWalletPurchaseRequest,
+  getWalletPurchaseRequests,
+  isWalletSheetQuotaError,
+} from "../../lib/wallet-ledger.js";
 import {
   sendWalletPurchaseRequestEmail,
   sendWalletPurchaseStatusEmail,
 } from "../../lib/wallet-mailer.js";
 import { createWalletNotification } from "../../lib/wallet-notifications.js";
+import { applyPurchaseDecision } from "../../lib/purchase-decisions.js";
 
 const CATALOG_URL =
   "https://raw.githubusercontent.com/mhdpstudio/GameOnix-Data-Content/main/recharge.json";
@@ -42,17 +47,148 @@ function isValidOptionalText(value, maxLength = 120) {
   return typeof value === "string" && value.trim().length <= maxLength;
 }
 
+const DECISION_ACTIONS = new Set([
+  "approve-purchase-request",
+  "reject-purchase-request",
+]);
+
+function getAdminUsernames() {
+  return new Set(
+    String(process.env.GAMEONIX_NOTIFICATION_ADMIN_USERNAMES || "")
+      .split(",")
+      .map((adminUsername) => adminUsername.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function requireAdmin(req, res) {
+  const username = requireUser(req, res);
+  if (!username) return null;
+
+  if (!getAdminUsernames().has(username.toLowerCase())) {
+    res.status(403).json({ error: "Admin access is required." });
+    return null;
+  }
+
+  return username;
+}
+
+function sendWalletQuotaError(res) {
+  res.setHeader("Retry-After", "60");
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  return res.status(429).json({
+    error:
+      "Google Sheets is rate limited (60 reads per minute per user). Wait about a minute, then try again.",
+  });
+}
+
+async function handleProductRequestList(req, res) {
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const requests = await getWalletPurchaseRequests();
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    return res.status(200).json({ success: true, requests });
+  } catch (error) {
+    if (isWalletSheetQuotaError(error)) return sendWalletQuotaError(res);
+    console.error("Wallet product request list failed:", error);
+    return res
+      .status(500)
+      .json({ error: "Unable to load product requests." });
+  }
+}
+
+async function handleProductRequestDecision(req, res, body) {
+  if (!requireAdmin(req, res)) return;
+
+  const { action, requestId, giftCardCodes } = body;
+  if (typeof requestId !== "string" || !requestId.trim()) {
+    return res.status(400).json({ error: "The product request id is required." });
+  }
+  if (
+    giftCardCodes !== undefined &&
+    (!Array.isArray(giftCardCodes) ||
+      giftCardCodes.some(
+        (code) => typeof code !== "string" || code.length > 200
+      ))
+  ) {
+    return res.status(400).json({ error: "The gift card codes are invalid." });
+  }
+
+  try {
+    const result = await applyPurchaseDecision({
+      requestId: requestId.trim(),
+      action: action === "approve-purchase-request" ? "approve" : "reject",
+      giftCardCodes: Array.isArray(giftCardCodes) ? giftCardCodes : [],
+    });
+
+    if (result.kind === "missing") {
+      return res
+        .status(404)
+        .json({ error: "This product request was not found." });
+    }
+    if (result.kind === "unavailable") {
+      return res.status(409).json({
+        error: `This request is no longer pending. Current status: ${result.status || "unknown"}.`,
+      });
+    }
+    if (result.kind === "changed") {
+      return res.status(409).json({
+        error: "The request details changed. Refresh the list and review it again.",
+      });
+    }
+    if (result.kind === "insufficientFunds") {
+      return res.status(409).json({
+        error: `Insufficient wallet balance (EGP ${Number(result.balance || 0).toFixed(2)}). No money was deducted.`,
+      });
+    }
+
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    return res.status(200).json({
+      success: true,
+      status: result.status,
+      message: result.message,
+      notificationCreated: result.notificationCreated,
+      emailSent: result.emailSent,
+      balance: result.balance,
+      request: result.request,
+    });
+  } catch (error) {
+    if (isWalletSheetQuotaError(error)) return sendWalletQuotaError(res);
+
+    const message =
+      typeof error?.message === "string" && error.message.trim()
+        ? error.message.trim()
+        : "Unable to process this product request.";
+    console.error("Wallet product request decision failed:", error);
+    return res
+      .status(/gift card/i.test(message) ? 400 : 500)
+      .json({ error: message });
+  }
+}
+
 export default async function handler(req, res) {
   if (setCors(req, res)) return;
+
+  if (req.method === "GET") {
+    return handleProductRequestList(req, res);
+  }
+
   if (req.method !== "POST") {
-    res.setHeader("Allow", "POST, OPTIONS");
+    res.setHeader("Allow", "GET, POST, OPTIONS");
     return res.status(405).json({ error: "Method not allowed." });
+  }
+
+  const body = getRequestBody(req);
+  if (DECISION_ACTIONS.has(body.action)) {
+    return handleProductRequestDecision(req, res, body);
+  }
+  if (typeof body.action === "string" && body.action.trim()) {
+    return res.status(400).json({ error: "Unsupported product request action." });
   }
 
   const username = requireUser(req, res);
   if (!username) return;
-
-  const body = getRequestBody(req);
   const {
     productId,
     packIndex,
@@ -190,6 +326,8 @@ export default async function handler(req, res) {
       packageName: `${String(pack.title || "")}${pack.type ? ` ${String(pack.type)}` : ""}`.trim(),
       packageTitle: String(pack.title || ""),
       packageType: String(pack.type || ""),
+      // "Top-Up" for game recharge packs, "Gift Cards" for redeemable codes.
+      productType: String(product.type || "").trim(),
       isGiftCard,
       quantity,
       paymentMethod: selectedPayment.name,
@@ -265,6 +403,7 @@ export default async function handler(req, res) {
       userEmailSent: userEmailResult.status === "fulfilled",
     });
   } catch (error) {
+    if (isWalletSheetQuotaError(error)) return sendWalletQuotaError(res);
     console.error("Game wallet purchase request failed:", error);
     return res.status(500).json({
       error: error.message || "Unable to submit this game purchase request.",

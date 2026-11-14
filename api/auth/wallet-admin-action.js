@@ -365,7 +365,11 @@ export default async function handler(req, res) {
     const notificationOrderDetails = isPurchase
       ? { ...result.details }
       : {};
-    delete notificationOrderDetails.giftCardCodes;
+    // Keep the delivered codes for gift card orders so the player can read them
+    // in the app; top-up orders never carry codes.
+    if (notificationOrderDetails.isGiftCard !== true) {
+      delete notificationOrderDetails.giftCardCodes;
+    }
     let notificationCreated = true;
     try {
       await createWalletNotification({
