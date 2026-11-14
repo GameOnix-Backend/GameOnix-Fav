@@ -105,6 +105,20 @@ function getNotificationAdmins() {
   );
 }
 
+function isSheetsRateLimitError(error) {
+  const status = Number(error?.response?.status ?? error?.code);
+  const reasons = Array.isArray(error?.errors)
+    ? error.errors.map((item) => item.reason)
+    : [];
+  return (
+    status === 429 ||
+    (status === 403 &&
+      reasons.some((reason) =>
+        ["rateLimitExceeded", "userRateLimitExceeded"].includes(reason)
+      ))
+  );
+}
+
 function createAdminActionToken(username) {
   const secret = process.env.GAMEONIX_API_TOKEN_SECRET;
   if (!secret || secret.length < 32) {
@@ -298,6 +312,12 @@ export default async function handler(req, res) {
     return res.status(200).json({ success: true });
   } catch (error) {
     console.error("Wallet notifications request failed:", error);
+    if (isSheetsRateLimitError(error)) {
+      res.setHeader("Retry-After", "5");
+      return res.status(503).json({
+        error: "Notifications are temporarily rate-limited. Please try again shortly.",
+      });
+    }
     return res.status(500).json({
       error: "Unable to load or update your notifications.",
     });
