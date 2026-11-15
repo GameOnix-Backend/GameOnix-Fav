@@ -98,6 +98,7 @@ export default async function handler(req, res) {
         topicLabel,
         orderId,
         email,
+        message,
       },
     });
 

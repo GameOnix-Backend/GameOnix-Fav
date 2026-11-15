@@ -95,6 +95,7 @@ export default async function handler(req, res) {
       message: `Your report about ${game.title} was sent to the GameOnix team.`,
       type: "bug_report",
       details: {
+        email,
         gameTitle: game.title,
         gameName: game.title,
         slug: game.slug,

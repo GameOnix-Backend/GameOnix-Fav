@@ -7,6 +7,7 @@ import {
   deleteAllWalletNotifications,
   deleteWalletNotification,
   getWalletNotifications,
+  getSupportReports,
   markAllWalletNotificationsRead,
   markWalletNotificationRead,
   updateGameRequestNotification,
@@ -153,6 +154,14 @@ export default async function handler(req, res) {
   res.setHeader("Cache-Control", "private, no-store, max-age=0");
 
   try {
+    if (req.method === "GET" && req.query?.admin === "reports") {
+      if (!getNotificationAdmins().has(username.toLowerCase())) {
+        return res.status(403).json({ error: "Admin access is required." });
+      }
+      const reports = await getSupportReports();
+      return res.status(200).json({ reports, canSend: true });
+    }
+
     if (req.method === "DELETE") {
       const { notificationId, deleteAll } = getRequestBody(req);
       if (deleteAll === true) {
