@@ -229,12 +229,11 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: "A valid report ID is required." });
       }
       const deleted = await deleteSupportReportNotification(notificationId);
-      if (!deleted) {
-        return res.status(404).json({ error: "Support report was not found." });
-      }
       return res.status(200).json({
         success: true,
-        message: "Support report deleted.",
+        message: deleted
+          ? "Support report deleted."
+          : "Support report was already removed.",
       });
     }
 
