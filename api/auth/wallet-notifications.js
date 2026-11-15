@@ -8,12 +8,18 @@ import {
   deleteWalletNotification,
   getWalletNotifications,
   getSupportReports,
+  updateSupportReportNotification,
   markAllWalletNotificationsRead,
   markWalletNotificationRead,
   updateGameRequestNotification,
 } from "../../lib/wallet-notifications.js";
 import { getWalletTransactions } from "../../lib/wallet-ledger.js";
-import { sendGameRequestReplyEmail } from "../../lib/wallet-mailer.js";
+import { getWalletBalanceByUsername } from "../../lib/sheets.js";
+import {
+  sendGameBugReportReplyEmail,
+  sendGameRequestReplyEmail,
+  sendSupportReplyEmail,
+} from "../../lib/wallet-mailer.js";
 
 function enrichLegacyNotificationDetails(notifications, transactions) {
   return notifications.map((notification) => {
@@ -210,6 +216,185 @@ export default async function handler(req, res) {
     }
 
     const body = getRequestBody(req);
+    if (body.action === "reply-support-report") {
+      if (!getNotificationAdmins().has(username.toLowerCase())) {
+        return res.status(403).json({ error: "Admin access is required." });
+      }
+
+      const notificationId =
+        typeof body.notificationId === "string"
+          ? body.notificationId.trim()
+          : "";
+      const reply =
+        typeof body.reply === "string"
+          ? body.reply.replace(/\r\n?/g, "\n").trim()
+          : "";
+      if (
+        !notificationId ||
+        notificationId.length > 100 ||
+        !reply ||
+        reply.length > 2000
+      ) {
+        return res.status(400).json({
+          error: "Enter a valid report ID and a reply of up to 2,000 characters.",
+        });
+      }
+
+      let needsNotification = true;
+      let needsEmail = true;
+      const replyAt = new Date().toISOString();
+      let report = await updateSupportReportNotification({
+        notificationId,
+        updateDetails: (current) => {
+          if (current.reply === reply) {
+            needsNotification = !String(current.replyNotificationId || "");
+            needsEmail = !String(current.replyEmailSentAt || "");
+            if (!needsNotification) return current;
+            return {
+              ...current,
+              replyAt: current.replyAt || replyAt,
+            };
+          }
+          needsNotification = true;
+          needsEmail = true;
+          return {
+            ...current,
+            reply,
+            replyAt,
+            replyNotificationId: "",
+            replyEmailSentAt: "",
+          };
+        },
+      });
+      if (!report) {
+        return res.status(404).json({ error: "Support report was not found." });
+      }
+
+      if (!needsNotification && !needsEmail) {
+        return res.status(200).json({
+          success: true,
+          message: "This reply was already sent in GameOnix and by email.",
+          notificationSent: true,
+          emailSent: true,
+        });
+      }
+
+      const reportDetails = report.details;
+      const topic = String(
+        reportDetails.topicLabel || reportDetails.topic || "Support request"
+      );
+      const gameTitle = String(
+        reportDetails.gameTitle || reportDetails.gameName || "Game report"
+      );
+      let playerEmail = String(reportDetails.email || "").trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(playerEmail)) {
+        const account = await getWalletBalanceByUsername(report.username);
+        playerEmail = String(account?.email || "").trim().toLowerCase();
+      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(playerEmail)) {
+        return res.status(400).json({
+          error: "A valid account email is required to reply to this report.",
+        });
+      }
+
+      let playerNotification;
+      if (needsNotification) {
+        try {
+          playerNotification = await createWalletNotification({
+            username: report.username,
+            title:
+              report.type === "bug_report"
+                ? "Reply to your game report"
+                : "Reply from GameOnix support",
+            message: reply,
+            type:
+              report.type === "bug_report"
+                ? "bug_report_reply"
+                : "support_reply",
+            details: {
+              reportId: notificationId,
+              topicLabel: topic,
+              orderId: String(reportDetails.orderId || ""),
+              gameTitle,
+              gameName: gameTitle,
+              slug: String(reportDetails.slug || ""),
+              platform: String(reportDetails.platform || ""),
+              reply,
+            },
+          });
+          report = await updateSupportReportNotification({
+            notificationId,
+            updateDetails: (current) => {
+              if (current.reply !== reply) {
+                throw new Error("The report reply changed before it was saved.");
+              }
+              return {
+                ...current,
+                replyNotificationId: playerNotification.id,
+              };
+            },
+          });
+          if (!report) throw new Error("Support report was not found.");
+        } catch (error) {
+          if (playerNotification) {
+            try {
+              await deleteWalletNotification(report.username, playerNotification.id);
+            } catch (cleanupError) {
+              console.error("Failed to clean up support reply notification:", cleanupError);
+            }
+          }
+          throw error;
+        }
+      }
+
+      if (needsEmail) {
+        try {
+          if (report.type === "bug_report") {
+            await sendGameBugReportReplyEmail({
+              gameTitle,
+              reply,
+              username: report.username,
+              to: playerEmail,
+            });
+          } else {
+            await sendSupportReplyEmail({
+              topic,
+              orderId: String(reportDetails.orderId || ""),
+              reply,
+              username: report.username,
+              to: playerEmail,
+            });
+          }
+        } catch (error) {
+          console.error("Support report reply email failed:", error);
+          return res.status(502).json({
+            error:
+              "The in-app notification was sent, but the email failed. Retry this reply to send the email without duplicating the notification.",
+            notificationSent: true,
+            emailSent: false,
+          });
+        }
+
+        const emailSentAt = new Date().toISOString();
+        await updateSupportReportNotification({
+          notificationId,
+          updateDetails: (current) => {
+            if (current.reply !== reply) {
+              throw new Error("The report reply changed before delivery was recorded.");
+            }
+            return { ...current, replyEmailSentAt: emailSentAt };
+          },
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Reply sent in GameOnix and by email.",
+        notificationSent: true,
+        emailSent: true,
+      });
+    }
+
     if (body.action === "delete-game-request") {
       if (!getNotificationAdmins().has(username.toLowerCase())) {
         return res.status(403).json({ error: "Admin access is required." });
