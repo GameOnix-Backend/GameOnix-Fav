@@ -4,6 +4,7 @@ import { setCors } from "../../lib/http.js";
 import {
   createWalletNotification,
   deleteGameRequestNotification,
+  deleteSupportReportNotification,
   deleteAllWalletNotifications,
   deleteWalletNotification,
   getWalletNotifications,
@@ -216,6 +217,27 @@ export default async function handler(req, res) {
     }
 
     const body = getRequestBody(req);
+    if (body.action === "delete-support-report") {
+      if (!getNotificationAdmins().has(username.toLowerCase())) {
+        return res.status(403).json({ error: "Admin access is required." });
+      }
+      const notificationId =
+        typeof body.notificationId === "string"
+          ? body.notificationId.trim()
+          : "";
+      if (!notificationId || notificationId.length > 100) {
+        return res.status(400).json({ error: "A valid report ID is required." });
+      }
+      const deleted = await deleteSupportReportNotification(notificationId);
+      if (!deleted) {
+        return res.status(404).json({ error: "Support report was not found." });
+      }
+      return res.status(200).json({
+        success: true,
+        message: "Support report deleted.",
+      });
+    }
+
     if (body.action === "reply-support-report") {
       if (!getNotificationAdmins().has(username.toLowerCase())) {
         return res.status(403).json({ error: "Admin access is required." });
