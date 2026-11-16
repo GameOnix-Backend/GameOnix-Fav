@@ -11,6 +11,7 @@ import {
   getWalletNotifications,
   getSupportReports,
   updateSupportReportNotification,
+  markSupportReportUnread,
   markAllWalletNotificationsRead,
   markWalletNotificationRead,
   updateGameRequestNotification,
@@ -310,6 +311,7 @@ export default async function handler(req, res) {
         });
       }
 
+      await markSupportReportUnread(notificationId);
       const reportDetails = report.details;
       const topic = String(
         reportDetails.topicLabel || reportDetails.topic || "Support request"
@@ -785,6 +787,70 @@ export default async function handler(req, res) {
       return res.status(201).json({ success: true, notification });
     }
 
+    if (body.action === "edit-support-message" || body.action === "delete-support-message") {
+      const notificationId = typeof body.notificationId === "string" ? body.notificationId.trim() : "";
+      const messageId = typeof body.messageId === "string" ? body.messageId.trim() : "";
+      const isAdmin = getNotificationAdmins().has(username.toLowerCase());
+      if (!notificationId || !messageId || notificationId.length > 100 || messageId.length > 100) {
+        return res.status(400).json({ error: "A valid ticket and message are required." });
+      }
+      const report = isAdmin
+        ? (await getSupportReports()).find((item) => item.id === notificationId)
+        : (await getWalletNotifications(username)).find((item) =>
+            item.id === notificationId && ["support_request", "bug_report"].includes(item.type)
+          );
+      if (!report) return res.status(404).json({ error: "Support ticket was not found." });
+      const replacement = typeof body.message === "string" ? body.message.trim() : "";
+      if (body.action === "edit-support-message" && (!replacement || replacement.length > 2000)) {
+        return res.status(400).json({ error: "Write a message of up to 2,000 characters." });
+      }
+      if (body.action === "edit-support-message" && !isAdmin) {
+        const moderation = await checkCommunityText(username, replacement);
+        if (!moderation.allowed) return res.status(moderation.status).json(moderation);
+      }
+      let denied = false;
+      let found = false;
+      const result = await updateSupportReportNotification({
+        notificationId,
+        updateDetails: (current) => {
+          const messages = Array.isArray(current.messages) ? current.messages : [{
+            id: notificationId,
+            author: "user",
+            username: report.username,
+            message: String(current.message || current.description || ""),
+            createdAt: report.createdAt,
+          }];
+          const index = messages.findIndex((item) => item && item.id === messageId);
+          if (index < 0) return current;
+          const target = messages[index];
+          if (!isAdmin && (target.author !== "user" || String(target.username || "").toLowerCase() !== username.toLowerCase())) {
+            denied = true;
+            return current;
+          }
+          found = true;
+          if (body.action === "delete-support-message") {
+            const next = { ...current, messages: messages.filter((item) => item && item.id !== messageId) };
+            if (messageId === notificationId) {
+              next.message = "";
+              next.description = "";
+            }
+            return next;
+          }
+          const nextMessages = [...messages];
+          nextMessages[index] = { ...target, message: replacement, editedAt: new Date().toISOString() };
+          const next = { ...current, messages: nextMessages };
+          if (messageId === notificationId) {
+            if (typeof next.message === "string") next.message = replacement;
+            if (typeof next.description === "string") next.description = replacement;
+          }
+          return next;
+        },
+      });
+      if (denied) return res.status(403).json({ error: "You can edit or delete only your own messages." });
+      if (!result || !found) return res.status(404).json({ error: "Message was not found." });
+      return res.status(200).json({ success: true, report: result });
+    }
+
     if (body.action === "reply-support-thread") {
       const notificationId = typeof body.notificationId === "string" ? body.notificationId.trim() : "";
       const message = typeof body.message === "string" ? body.message.trim() : "";
@@ -814,15 +880,7 @@ export default async function handler(req, res) {
         }),
       });
       if (!report) return res.status(404).json({ error: "Support conversation was not found." });
-      for (const adminUsername of getNotificationAdmins()) {
-        await createWalletNotification({
-          username: adminUsername,
-          title: "New support message",
-          message,
-          type: "support_message",
-          details: { reportId: notificationId, sender: username },
-        });
-      }
+      await markSupportReportUnread(notificationId);
       return res.status(200).json({ success: true, report });
     }
 

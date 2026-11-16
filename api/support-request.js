@@ -97,6 +97,7 @@ export default async function handler(req, res) {
       }`,
       type: "support_request",
       details: {
+        name: cleanText(account?.name, 120),
         topic,
         topicLabel,
         orderId,
