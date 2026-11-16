@@ -848,7 +848,8 @@ export default async function handler(req, res) {
           const index = messages.findIndex((item) => item && item.id === messageId);
           if (index < 0) return current;
           const target = messages[index];
-          if (!isAdmin && (target.author !== "user" || String(target.username || "").toLowerCase() !== username.toLowerCase())) {
+          const ownsMessage = target.author === (isAdmin ? "admin" : "user") && String(target.username || "").toLowerCase() === username.toLowerCase();
+          if ((body.action === "delete-support-message" || !isAdmin) && !ownsMessage) {
             denied = true;
             return current;
           }
