@@ -796,20 +796,31 @@ export default async function handler(req, res) {
       if (!notificationId || notificationId.length > 100 || !["pending", "resolved", "closed"].includes(status)) {
         return res.status(400).json({ error: "Choose pending, resolved, or closed for this ticket." });
       }
+      let notifyPlayer = false;
       const report = await updateSupportReportNotification({
         notificationId,
-        updateDetails: (current) => ({ ...current, status, statusUpdatedAt: new Date().toISOString(), statusUpdatedBy: username }),
+        updateDetails: (current) => {
+          const previous = String(current.status || "pending").toLowerCase();
+          const previousNormalized = previous === "answered" ? "resolved" : previous === "open" ? "pending" : previous;
+          if (previousNormalized === status) {
+            if (previous === status) return current;
+            return { ...current, status };
+          }
+          notifyPlayer = true;
+          return { ...current, status, statusUpdatedAt: new Date().toISOString(), statusUpdatedBy: username };
+        },
       });
       if (!report) return res.status(404).json({ error: "Support ticket was not found." });
-      const statusLabel = status === "resolved" ? "resolved" : status === "closed" ? "closed" : "pending";
-      await createWalletNotification({
-        username: report.username,
-        title: "Support ticket status updated",
-        message: `Your ${String(report.details?.topicLabel || report.details?.topic || "support")} ticket is now ${statusLabel}.`,
-        type: "support_status",
-        details: { ticketId: notificationId, status: statusLabel },
-      });
-      return res.status(200).json({ success: true, report });
+      if (notifyPlayer) {
+        await createWalletNotification({
+          username: report.username,
+          title: "Support ticket status updated",
+          message: `Your ${String(report.details?.topicLabel || report.details?.topic || "support")} ticket is now ${status}.`,
+          type: "support_status",
+          details: { ticketId: notificationId, status },
+        });
+      }
+      return res.status(200).json({ success: true, report, notificationSent: notifyPlayer });
     }
 
     if (body.action === "edit-support-message" || body.action === "delete-support-message") {
