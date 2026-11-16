@@ -1,7 +1,7 @@
 import jwt from "jsonwebtoken";
 import { requireUser } from "../lib/auth.js";
 import { setCors } from "../lib/http.js";
-import { getWalletBalanceByUsername } from "../lib/sheets.js";
+import { checkCommunityText, getWalletBalanceByUsername } from "../lib/sheets.js";
 import {
   createWalletNotification,
   deleteWalletNotification,
@@ -73,6 +73,9 @@ export default async function handler(req, res) {
       error: "Please describe the issue in at least 10 characters.",
     });
   }
+
+  const moderation = await checkCommunityText(username, description);
+  if (!moderation.allowed) return res.status(moderation.status).json(moderation);
 
   let notification;
   try {

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import jwt from "jsonwebtoken";
 import { requireUser } from "../../lib/auth.js";
 import { setCors } from "../../lib/http.js";
@@ -15,7 +16,7 @@ import {
   updateGameRequestNotification,
 } from "../../lib/wallet-notifications.js";
 import { getWalletTransactions } from "../../lib/wallet-ledger.js";
-import { getWalletBalanceByUsername } from "../../lib/sheets.js";
+import { checkCommunityText, getWalletBalanceByUsername } from "../../lib/sheets.js";
 import {
   sendGameBugReportReplyEmail,
   sendGameRequestReplyEmail,
@@ -264,6 +265,7 @@ export default async function handler(req, res) {
       let needsNotification = true;
       let needsEmail = true;
       const replyAt = new Date().toISOString();
+      const replyMessageId = randomUUID();
       let report = await updateSupportReportNotification({
         notificationId,
         updateDetails: (current) => {
@@ -282,6 +284,13 @@ export default async function handler(req, res) {
             ...current,
             reply,
             replyAt,
+            messages: [
+              ...(Array.isArray(current.messages) ? current.messages : [{
+                id: notificationId, author: "user", username: "",
+                message: String(current.message || ""), createdAt: replyAt,
+              }]),
+              { id: replyMessageId, author: "admin", username, message: reply, createdAt: replyAt },
+            ].slice(-100),
             replyNotificationId: "",
             replyEmailSentAt: "",
           };
@@ -334,6 +343,7 @@ export default async function handler(req, res) {
                 : "support_reply",
             details: {
               reportId: notificationId,
+              threadMessageId: replyMessageId,
               topicLabel: topic,
               orderId: String(reportDetails.orderId || ""),
               gameTitle,
@@ -772,6 +782,46 @@ export default async function handler(req, res) {
         details: imageData ? { imageData } : null,
       });
       return res.status(201).json({ success: true, notification });
+    }
+
+    if (body.action === "reply-support-thread") {
+      const notificationId = typeof body.notificationId === "string" ? body.notificationId.trim() : "";
+      const message = typeof body.message === "string" ? body.message.trim() : "";
+      if (!notificationId || notificationId.length > 100 || !message || message.length > 2000) {
+        return res.status(400).json({ error: "Write a message of up to 2,000 characters." });
+      }
+      const ownedReport = (await getWalletNotifications(username)).find((item) =>
+        item.id === notificationId && ["support_request", "bug_report"].includes(item.type)
+      );
+      if (!ownedReport) return res.status(404).json({ error: "Support conversation was not found." });
+      const moderation = await checkCommunityText(username, message);
+      if (!moderation.allowed) return res.status(moderation.status).json(moderation);
+      const sentAt = new Date().toISOString();
+      const report = await updateSupportReportNotification({
+        notificationId,
+        updateDetails: (current) => ({
+          ...current,
+          messages: [
+            ...(Array.isArray(current.messages) ? current.messages : [{
+              id: notificationId, author: "user", username,
+              message: String(current.message || ""),
+              createdAt: String(ownedReport.createdAt || sentAt),
+            }]),
+            { id: randomUUID(), author: "user", username, message, createdAt: sentAt },
+          ].slice(-100),
+        }),
+      });
+      if (!report) return res.status(404).json({ error: "Support conversation was not found." });
+      for (const adminUsername of getNotificationAdmins()) {
+        await createWalletNotification({
+          username: adminUsername,
+          title: "New support message",
+          message,
+          type: "support_message",
+          details: { reportId: notificationId, sender: username },
+        });
+      }
+      return res.status(200).json({ success: true, report });
     }
 
     const { notificationId, markAll } = body;

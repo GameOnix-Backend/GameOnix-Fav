@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { requireUser } from "../../lib/auth.js";
 import { setCors } from "../../lib/http.js";
-import { getReviews, saveReviewByUsername } from "../../lib/sheets.js";
+import {
+  addReviewReplyById,
+  checkCommunityText,
+  getReviews,
+  saveReviewByUsername,
+} from "../../lib/sheets.js";
 
 function getRequestBody(req) {
   if (req.body && typeof req.body === "object") return req.body;
@@ -66,6 +71,24 @@ export default async function handler(req, res) {
     if (!username) return;
 
     const body = getRequestBody(req);
+    if (body.action === "reply") {
+      const reviewId = typeof body.reviewId === "string" ? body.reviewId.trim() : "";
+      let reply;
+      try {
+        reply = normalizeText(body.reply, "Reply", 600);
+      } catch (error) {
+        return res.status(400).json({ error: error.message });
+      }
+      const moderation = await checkCommunityText(username, reply);
+      if (!moderation.allowed) return res.status(moderation.status).json(moderation);
+      if (!reviewId || reviewId.length > 100) {
+        return res.status(400).json({ error: "A valid review ID is required." });
+      }
+      const result = await addReviewReplyById(reviewId, username, reply);
+      if (!result) return res.status(404).json({ error: "Review was not found." });
+      return res.status(200).json(result);
+    }
+
     if (!["game", "site"].includes(body.target)) {
       return res.status(400).json({ error: "Invalid review target." });
     }
@@ -78,6 +101,8 @@ export default async function handler(req, res) {
       }
 
       const comment = normalizeText(body.comment, "Review", 2000);
+      const moderation = await checkCommunityText(username, comment);
+      if (!moderation.allowed) return res.status(moderation.status).json(moderation);
       review = {
         type: "review",
         id: randomUUID(),

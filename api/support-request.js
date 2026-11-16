@@ -1,7 +1,7 @@
 import jwt from "jsonwebtoken";
 import { requireUser } from "../lib/auth.js";
 import { setCors } from "../lib/http.js";
-import { getWalletBalanceByUsername } from "../lib/sheets.js";
+import { checkCommunityText, getWalletBalanceByUsername } from "../lib/sheets.js";
 import {
   createWalletNotification,
   deleteWalletNotification,
@@ -66,6 +66,9 @@ export default async function handler(req, res) {
       error: `Add at least ${MIN_MESSAGE_LENGTH} characters so we can help.`,
     });
   }
+
+  const moderation = await checkCommunityText(username, message);
+  if (!moderation.allowed) return res.status(moderation.status).json(moderation);
 
   const topicLabel = TOPIC_LABELS[topic];
   let notification;
