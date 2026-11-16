@@ -284,10 +284,11 @@ export default async function handler(req, res) {
             ...current,
             reply,
             replyAt,
+            status: "answered",
             messages: [
               ...(Array.isArray(current.messages) ? current.messages : [{
                 id: notificationId, author: "user", username: "",
-                message: String(current.message || ""), createdAt: replyAt,
+                message: String(current.message || current.description || ""), createdAt: replyAt,
               }]),
               { id: replyMessageId, author: "admin", username, message: reply, createdAt: replyAt },
             ].slice(-100),
@@ -801,10 +802,11 @@ export default async function handler(req, res) {
         notificationId,
         updateDetails: (current) => ({
           ...current,
+          status: "open",
           messages: [
             ...(Array.isArray(current.messages) ? current.messages : [{
               id: notificationId, author: "user", username,
-              message: String(current.message || ""),
+              message: String(current.message || current.description || ""),
               createdAt: String(ownedReport.createdAt || sentAt),
             }]),
             { id: randomUUID(), author: "user", username, message, createdAt: sentAt },

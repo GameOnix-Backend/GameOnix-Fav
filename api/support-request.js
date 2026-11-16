@@ -102,6 +102,7 @@ export default async function handler(req, res) {
         orderId,
         email,
         message,
+        status: "open",
       },
     });
 
@@ -135,7 +136,8 @@ export default async function handler(req, res) {
     });
 
     return res.status(200).json({
-      message: "Your message was sent to the GameOnix support team.",
+      message: "Your ticket was sent to the GameOnix support team.",
+      ticketId: notification.id,
     });
   } catch (error) {
     console.error("Support message failed:", error.message);
