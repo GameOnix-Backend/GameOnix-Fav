@@ -5,6 +5,7 @@ import { setCors } from "../../lib/http.js";
 import {
   createWalletNotification,
   deleteGameRequestNotification,
+  deleteExpiredSupportReports,
   deleteSupportReportNotification,
   deleteAllWalletNotifications,
   deleteWalletNotification,
@@ -158,6 +159,16 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed." });
   }
 
+  if (req.method === "GET" && req.query?.cron === "support-expiry") {
+    const cronSecret = process.env.CRON_SECRET;
+    if (!cronSecret) return res.status(503).json({ error: "Support ticket cleanup is not configured." });
+    if (req.headers.authorization !== `Bearer ${cronSecret}`) {
+      return res.status(401).json({ error: "Cron authorization is required." });
+    }
+    const cleanup = await deleteExpiredSupportReports();
+    return res.status(200).json({ success: true, ...cleanup });
+  }
+
   const username = requireUser(req, res);
   if (!username) return;
   res.setHeader("Cache-Control", "private, no-store, max-age=0");
@@ -167,6 +178,7 @@ export default async function handler(req, res) {
       if (!getNotificationAdmins().has(username.toLowerCase())) {
         return res.status(403).json({ error: "Admin access is required." });
       }
+      await deleteExpiredSupportReports();
       const reports = await getSupportReports();
       return res.status(200).json({ reports, canSend: true });
     }
@@ -196,6 +208,9 @@ export default async function handler(req, res) {
     }
 
     if (req.method === "GET") {
+      if (req.query?.support === "tickets") {
+        await deleteExpiredSupportReports();
+      }
       let notifications = await getWalletNotifications(username);
       if (
         notifications.some(
@@ -265,11 +280,16 @@ export default async function handler(req, res) {
 
       let needsNotification = true;
       let needsEmail = true;
+      let statusBlocked = false;
       const replyAt = new Date().toISOString();
       const replyMessageId = randomUUID();
       let report = await updateSupportReportNotification({
         notificationId,
         updateDetails: (current) => {
+          if (["resolved", "closed", "answered"].includes(String(current.status || "").toLowerCase())) {
+            statusBlocked = true;
+            return current;
+          }
           if (current.reply === reply) {
             needsNotification = !String(current.replyNotificationId || "");
             needsEmail = !String(current.replyEmailSentAt || "");
@@ -285,7 +305,9 @@ export default async function handler(req, res) {
             ...current,
             reply,
             replyAt,
-            status: "answered",
+            status: "pending",
+            resolvedAt: "",
+            closedAt: "",
             messages: [
               ...(Array.isArray(current.messages) ? current.messages : [{
                 id: notificationId, author: "user", username: "",
@@ -300,6 +322,9 @@ export default async function handler(req, res) {
       });
       if (!report) {
         return res.status(404).json({ error: "Support report was not found." });
+      }
+      if (statusBlocked) {
+        return res.status(409).json({ error: "This ticket is resolved. Reopen it before sending another message." });
       }
 
       if (!needsNotification && !needsEmail) {
@@ -802,12 +827,30 @@ export default async function handler(req, res) {
         updateDetails: (current) => {
           const previous = String(current.status || "pending").toLowerCase();
           const previousNormalized = previous === "answered" ? "resolved" : previous === "open" ? "pending" : previous;
-          if (previousNormalized === status) {
-            if (previous === status) return current;
-            return { ...current, status };
+          const now = new Date().toISOString();
+          const next = { ...current, status };
+          if (previousNormalized !== status) {
+            notifyPlayer = true;
+            next.statusUpdatedAt = now;
+            next.statusUpdatedBy = username;
           }
-          notifyPlayer = true;
-          return { ...current, status, statusUpdatedAt: new Date().toISOString(), statusUpdatedBy: username };
+          if (status === "resolved") {
+            next.resolvedAt = previousNormalized === "resolved"
+              ? current.resolvedAt || current.statusUpdatedAt || current.replyAt || now
+              : now;
+            delete next.closedAt;
+          } else if (status === "closed") {
+            next.closedAt = previousNormalized === "closed"
+              ? current.closedAt || current.statusUpdatedAt || now
+              : now;
+            delete next.resolvedAt;
+          } else {
+            delete next.resolvedAt;
+            delete next.closedAt;
+          }
+          return previous === status && current.resolvedAt === next.resolvedAt && current.closedAt === next.closedAt
+            ? current
+            : next;
         },
       });
       if (!report) return res.status(404).json({ error: "Support ticket was not found." });
@@ -836,6 +879,9 @@ export default async function handler(req, res) {
             item.id === notificationId && ["support_request", "bug_report"].includes(item.type)
           );
       if (!report) return res.status(404).json({ error: "Support ticket was not found." });
+      if (body.action === "edit-support-message" && ["resolved", "closed", "answered"].includes(String(report.details?.status || "").toLowerCase())) {
+        return res.status(409).json({ error: "This ticket is resolved. Reopen it before editing messages." });
+      }
       const replacement = typeof body.message === "string" ? body.message.trim() : "";
       if (body.action === "edit-support-message" && (!replacement || replacement.length > 2000)) {
         return res.status(400).json({ error: "Write a message of up to 2,000 characters." });
@@ -898,6 +944,9 @@ export default async function handler(req, res) {
         item.id === notificationId && ["support_request", "bug_report"].includes(item.type)
       );
       if (!ownedReport) return res.status(404).json({ error: "Support conversation was not found." });
+      if (["resolved", "closed", "answered"].includes(String(ownedReport.details?.status || "").toLowerCase())) {
+        return res.status(409).json({ error: "This ticket is resolved. Reopen it before sending another message." });
+      }
       const moderation = await checkCommunityText(username, message);
       if (!moderation.allowed) return res.status(moderation.status).json(moderation);
       const sentAt = new Date().toISOString();
@@ -905,7 +954,9 @@ export default async function handler(req, res) {
         notificationId,
         updateDetails: (current) => ({
           ...current,
-          status: "open",
+          status: "pending",
+          resolvedAt: "",
+          closedAt: "",
           messages: [
             ...(Array.isArray(current.messages) ? current.messages : [{
               id: notificationId, author: "user", username,
