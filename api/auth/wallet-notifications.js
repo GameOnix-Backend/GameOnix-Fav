@@ -4,6 +4,9 @@ import { requireUser } from "../../lib/auth.js";
 import { setCors } from "../../lib/http.js";
 import {
   createWalletNotification,
+  createGameUpdateNotifications,
+  getGameUpdateNotifications,
+  markGameUpdateEmailsSent,
   deleteGameRequestNotification,
   deleteExpiredSupportReports,
   deleteSupportReportNotification,
@@ -23,7 +26,102 @@ import {
   sendGameBugReportReplyEmail,
   sendGameRequestReplyEmail,
   sendSupportReplyEmail,
+  sendGameUpdateEmail,
 } from "../../lib/wallet-mailer.js";
+
+async function deliverGameUpdate({ username, body, res }) {
+  if (!getNotificationAdmins().has(username.toLowerCase())) {
+    return res.status(403).json({ error: "Admin access is required." });
+  }
+  const publishId = typeof body.publishId === "string" ? body.publishId.trim() : "";
+  if (!/^[a-f0-9]{40}$/i.test(publishId) || !Array.isArray(body.games) || body.games.length > 100) {
+    return res.status(400).json({ error: "The published game update is invalid." });
+  }
+
+  let notificationsCreated = 0;
+  let emailsSent = 0;
+  const failures = [];
+  for (const game of body.games) {
+    const slug = typeof game?.slug === "string" ? game.slug.trim() : "";
+    const title = typeof game?.title === "string" ? game.title.trim() : "";
+    const releaseType = game?.releaseType === "new" ? "new" : "update";
+    const addonNames = Array.isArray(game?.addons)
+      ? game.addons.filter((item) => typeof item === "string").map((item) => item.trim()).filter(Boolean).slice(0, 30)
+      : [];
+    const followers = Array.isArray(game?.followers) ? game.followers : [];
+    if (!/^[a-z0-9][a-z0-9-]{0,159}$/i.test(slug) || !title || title.length > 160 || followers.length > 1000) {
+      return res.status(400).json({ error: "A published game or its follower list is invalid." });
+    }
+    const recipients = [...new Map(followers
+      .filter((follower) => follower &&
+        typeof follower.username === "string" && /^[a-z0-9_]{3,24}$/i.test(follower.username))
+      .map((follower) => [follower.username.toLowerCase(), {
+        username: follower.username.trim(),
+        email: typeof follower.email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(follower.email.trim())
+          ? follower.email.trim().toLowerCase() : "",
+      }]))].map(([, follower]) => follower);
+    if (!recipients.length) continue;
+
+    let existing = await getGameUpdateNotifications(publishId, slug);
+    const knownUsers = new Set(existing.map((notification) => notification.username.toLowerCase()));
+    const missing = recipients.filter((follower) => !knownUsers.has(follower.username.toLowerCase()));
+    if (missing.length) {
+      const message = releaseType === "new"
+        ? `${title} is now available on GameOnix.`
+        : `${title} has been updated on GameOnix.`;
+      const created = await createGameUpdateNotifications({
+        recipients: missing,
+        title: releaseType === "new" ? "A new game is available" : "A game you follow was updated",
+        message: addonNames.length ? `${message} Add-ons: ${addonNames.join(", ")}` : message,
+        details: { publishId, slug, gameTitle: title, releaseType, addons: addonNames },
+      });
+      notificationsCreated += created.length;
+      existing = await getGameUpdateNotifications(publishId, slug);
+    }
+
+    const recipientsByUsername = new Map(recipients.map((follower) => [follower.username.toLowerCase(), follower]));
+    const pendingEmails = existing.filter((notification) =>
+      recipientsByUsername.has(notification.username.toLowerCase()) &&
+      recipientsByUsername.get(notification.username.toLowerCase()).email &&
+      !notification.details.emailSentAt);
+    for (let offset = 0; offset < pendingEmails.length; offset += 400) {
+      const batch = pendingEmails.slice(offset, offset + 400);
+      try {
+        const mailResult = await sendGameUpdateEmail({
+          to: batch.map((notification) => recipientsByUsername.get(notification.username.toLowerCase()).email),
+          gameTitle: title,
+          slug,
+          releaseType,
+          addonNames,
+        });
+        const accepted = new Set(mailResult.accepted);
+        const delivered = batch.filter((notification) =>
+          accepted.has(recipientsByUsername.get(notification.username.toLowerCase()).email));
+        emailsSent += delivered.length;
+        if (delivered.length) await markGameUpdateEmailsSent(delivered);
+        const rejectedCount = batch.length - delivered.length;
+        if (rejectedCount) failures.push(`${title}: ${rejectedCount} follower email(s) were rejected.`);
+      } catch (error) {
+        failures.push(`${title}: ${error instanceof Error ? error.message : "email delivery failed"}`);
+      }
+    }
+  }
+
+  if (failures.length) {
+    console.error("Game update email delivery failed:", failures);
+    return res.status(502).json({
+      error: `In-app notifications were saved, but ${failures.length} follower email(s) failed. The publisher can safely retry this event.`,
+      notificationsCreated,
+      emailsSent,
+    });
+  }
+  return res.status(200).json({
+    success: true,
+    message: "Game followers were notified in GameOnix and by email.",
+    notificationsCreated,
+    emailsSent,
+  });
+}
 
 function enrichLegacyNotificationDetails(notifications, transactions) {
   return notifications.map((notification) => {
@@ -234,6 +332,9 @@ export default async function handler(req, res) {
     }
 
     const body = getRequestBody(req);
+    if (body.action === "publish-game-update") {
+      return await deliverGameUpdate({ username, body, res });
+    }
     if (body.action === "delete-support-report") {
       if (!getNotificationAdmins().has(username.toLowerCase())) {
         return res.status(403).json({ error: "Admin access is required." });
