@@ -195,6 +195,7 @@ export default async function handler(req, res) {
     quantity,
     paymentMethod,
     mobileNumber = "",
+    whatsappNumber = "",
     playerId = "",
     serverId = "",
     contactEmail = "",
@@ -214,6 +215,8 @@ export default async function handler(req, res) {
     typeof isGift !== "boolean" ||
     !isValidOptionalText(playerId) ||
     !isValidOptionalText(mobileNumber) ||
+    typeof whatsappNumber !== "string" ||
+    !/^[+\d][\d\s()-]{5,28}$/.test(whatsappNumber.trim()) ||
     !isValidOptionalText(serverId) ||
     !isValidOptionalText(contactEmail, 254) ||
     (contactEmail.trim() &&
@@ -334,6 +337,7 @@ export default async function handler(req, res) {
       paymentMethodLogo: String(selectedPayment.logo || ""),
       walletPayment: isWalletPayment,
       mobileNumber: mobileNumber.trim(),
+      whatsappNumber: whatsappNumber.trim(),
       playerId: isGift ? "" : playerId.trim(),
       serverId: serverId.trim(),
       isGift,
