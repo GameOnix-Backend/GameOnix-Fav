@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import jwt from "jsonwebtoken";
+import { fetchReplica } from "../../lib/serviceFetch.js";
 import { requireUser } from "../../lib/auth.js";
 import { setCors } from "../../lib/http.js";
 import {
@@ -837,9 +838,7 @@ export default async function handler(req, res) {
       }
 
       const token = createAdminActionToken(username);
-      const response = await fetch(
-        "https://gameonix-backend.vercel.app/api/auth/forgot-password",
-        {
+      const response = await fetchReplica("auth", "/api/auth/forgot-password", {
           method: "POST",
           headers: {
             Accept: "application/json",
@@ -847,8 +846,8 @@ export default async function handler(req, res) {
             Authorization: `Bearer ${token}`,
           },
           body: JSON.stringify({ action: "admin-reset-link", email }),
-          signal: AbortSignal.timeout(8000),
-        }
+        },
+        8000,
       );
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
