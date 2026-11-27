@@ -107,7 +107,7 @@ function getToken(req) {
   }
 
   if (typeof req.query?.token === "string") return req.query.token;
-  return new URL(req.url, "https://gameonixfav.vercel.app")
+  return new URL(req.url, "https://gameonix-fav-2.vercel.app")
     .searchParams.get("token");
 }
 
